@@ -1,0 +1,156 @@
+name: CI/CD — Build & Deploy to Production
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/habit-tracker
+
+jobs:
+  # ── 1. Lint & Type-check ──────────────────────────────────────────
+  lint:
+    name: Lint & Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: examples/habit-tracker/package-lock.json
+
+      - name: Install dependencies
+        working-directory: examples/habit-tracker
+        run: npm ci
+
+      - name: Type check
+        working-directory: examples/habit-tracker
+        run: npx tsc --noEmit
+
+  # ── 2. Build ──────────────────────────────────────────────────────
+  build:
+    name: Build Next.js
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: examples/habit-tracker/package-lock.json
+
+      - name: Install dependencies
+        working-directory: examples/habit-tracker
+        run: npm ci
+
+      - name: Build
+        working-directory: examples/habit-tracker
+        env:
+          NEXT_TELEMETRY_DISABLED: 1
+        run: npm run build
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextjs-build
+          path: examples/habit-tracker/.next/
+          retention-days: 1
+
+  # ── 3. Docker Build & Push ────────────────────────────────────────
+  docker:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-
+            type=raw,value=latest
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: examples/habit-tracker
+          file: examples/habit-tracker/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ── 4. Deploy to Production ───────────────────────────────────────
+  deploy:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: docker
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: production
+      url: https://your-domain.com   # <-- replace with your domain
+
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.PROD_HOST }}
+          username: ${{ secrets.PROD_USER }}
+          key: ${{ secrets.PROD_SSH_KEY }}
+          port: ${{ secrets.PROD_PORT || 22 }}
+          script: |
+            set -e
+
+            echo "==> Pulling latest image..."
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+            echo "==> Updating APP_VERSION in .env..."
+            cd ~/habit-tracker
+            sed -i "s/^APP_VERSION=.*/APP_VERSION=sha-$(echo ${{ github.sha }} | cut -c1-7)/" .env.production
+
+            echo "==> Rolling update (zero-downtime)..."
+            docker compose pull app
+            docker compose up -d --no-deps --build app
+
+            echo "==> Waiting for health check..."
+            sleep 10
+            STATUS=$(docker inspect --format='{{.State.Health.Status}}' habit-tracker-app)
+            if [ "$STATUS" != "healthy" ]; then
+              echo "Health check failed! Rolling back..."
+              docker compose up -d --no-deps --build app
+              exit 1
+            fi
+
+            echo "==> Cleaning up old images..."
+            docker image prune -f
+
+            echo "==> Deploy complete!"
