@@ -1,0 +1,21 @@
+## .NET
+bin/
+obj/
+*.user
+*.suo
+.vs/
+*.db
+*.db-shm
+*.db-wal
+
+## Secrets — never commit files with real keys/passwords
+.env.production          # real runtime secrets (Jwt__Key, DB password, etc.)
+.env.*.local
+appsettings.*.local.json # local overrides with real credentials
+# appsettings.Production.json is safe to commit — secrets injected via env vars
+
+## macOS
+.DS_Store
+
+## Build artifacts
+publish/
